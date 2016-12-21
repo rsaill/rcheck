@@ -1,5 +1,6 @@
 open Utils
 open Syntax
+open Syntax.P
 
 type t_atom =
   | A_String of string
@@ -22,7 +23,7 @@ type t_binary =
   | Antislash
   | Bar
   | Affectation
-  | BinOp_Expr of loc*e_builtin
+  | BinOp_Expr of loc*unit e_builtin
   | BinOp_Prop of prop_bop
   | BinOp_Pred of pred_bop
   | Pair of c_or_m
@@ -57,7 +58,7 @@ type t_guard =
   | G_blvar
   | G_binhyp
 
-type bi_t = E_BI of e_builtin | G_BI of t_guard
+type bi_t = E_BI of unit e_builtin | G_BI of t_guard
 
 let keywords : (string,bi_t) Hashtbl.t = Hashtbl.create 137
 
@@ -196,8 +197,8 @@ let rec to_expression : formula -> expression = function
            | None -> Ident (l,s)
        end
       | A_Integer i -> Builtin (l,Integer i)
-      | A_Empty_Set -> Builtin (l,Empty_Set)
-      | A_Empty_Seq -> Builtin (l,Empty_Seq)
+      | A_Empty_Set -> Builtin (l,Empty_Set ())
+      | A_Empty_Seq -> Builtin (l,Empty_Seq ())
       | A_Btrue | A_Bfalse -> raise (Error (l,"expression expected."))
       | A_Other -> raise (Error (l,"symbol not supported."))
     end
@@ -294,7 +295,7 @@ type to_guard_result =
 let is_joker s = String.length s = 1
 
 let substract (id_lst1:ident list) (id_lst2:ident list) : ident list =
-  let aux (id1:ident) : bool = not (List.exists (Utils.ident_eq id1) id_lst2) in
+  let aux (id1:ident) : bool = not (List.exists (ident_eq id1) id_lst2) in
   List.filter aux id_lst1
 
 let rec get_fvars : formula -> ident list = function

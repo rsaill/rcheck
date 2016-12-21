@@ -1,5 +1,6 @@
 open Utils
 open Syntax
+open Syntax.P
 
 val ignore_unknown_guards : bool ref
 
@@ -24,7 +25,7 @@ type t_binary =
   | Antislash
   | Bar
   | Affectation
-  | BinOp_Expr of loc*e_builtin
+  | BinOp_Expr of loc*unit e_builtin
   | BinOp_Prop of prop_bop
   | BinOp_Pred of pred_bop
   | Pair of c_or_m
