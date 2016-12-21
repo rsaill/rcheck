@@ -41,7 +41,8 @@ let is_forward_theory (tname:string) : bool =
 let check_rule (force_fwd:bool) (tname:string) (n:int) (r:Formula.r_rule) : unit =
   try
     let r = match Formula.to_rule r with 
-      | Syntax.Backward (guards,hyps,goal) when force_fwd -> Syntax.Forward (guards,hyps,goal)
+      | Syntax.P.Backward (guards,hyps,goal) when force_fwd ->
+        Syntax.P.Forward (guards,hyps,goal)
       | r -> r
     in
     ignore (Typing.check_rule r)

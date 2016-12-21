@@ -1,5 +1,6 @@
 open Utils
 open Syntax
+open Syntax.P
 
 val ignore_unknown_guards : bool ref
 

@@ -2,7 +2,7 @@
   open Lexing
   open Parser
 
-  exception Error of Utils.loc * string
+  exception Error of Syntax.P.loc * string
 
   let int_of_int_lit (s:string) : int =
     if String.get s 0 = '-' then

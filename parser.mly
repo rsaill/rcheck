@@ -2,6 +2,7 @@
 open Utils
 open Formula
 open Syntax
+open Syntax.P
 
 let binOp_Expr a = BinOp_Expr(dloc,a)
 let update_loc l = function
@@ -14,7 +15,7 @@ let update_loc l = function
 %token USERPASS
 %token IS
 %token END
-%token <Utils.loc*string> IDENT
+%token <Syntax.P.loc*string> IDENT
 %token <int> INTEGER
 %token EQUALEQUAL
 %token SEMICOLON

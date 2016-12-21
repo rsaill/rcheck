@@ -2,9 +2,9 @@ open Btype
 open Utils
 open Syntax
 
-exception Error of loc*string
+exception Error of P.loc*string
 
-let is_joker s = String.length s = 1
+let is_joker s = ( String.length s = 1 ) (*FIXME*)
 
 module M = Map.Make(
   struct
@@ -12,102 +12,45 @@ module M = Map.Make(
     let compare = String.compare
   end )
 
-(* *********************** LOCAL CONTEXT ************************************ *)
-
-module Local :
-sig
-  type t
-  val empty : t
-  val declare : t -> ident -> t
-  val add : t -> ident -> btype -> t
-  val get : t -> ident -> btype option
-  val mem : t -> ident -> bool
-  val remove : t -> ident -> t
-  val fold : (string -> (btype option) list -> 'a -> 'a) -> t -> 'a -> 'a
-  val to_list : t -> (string*btype option) list
-end = struct
-
-  type t = (btype option) list M.t
-
-  let empty = M.empty
-
-  let add (ctx:t) (id:ident) (ty:btype) : t =
-    if M.mem (snd id) ctx then
-      begin
-        match M.find (snd id) ctx with
-        | [] -> assert false
-        | (Some _)::_ ->
-          raise (Error (fst id,"the type of '"^ snd id ^"' is already known."))
-        | None::lst -> M.add (snd id) ((Some ty)::lst) ctx
-      end
-    else
-      raise (Error (fst id,"unknown identifier '"^ snd id ^"'."))
-
-  let get (ctx:t) (id:ident) =
-    try List.hd (M.find (snd id) ctx)
-    with Not_found -> raise (Error (fst id,"unknown identifier '"^ snd id ^"'."))
-
-  let mem (ctx:t) (id:ident) : bool = M.mem (snd id) ctx
-
-  let declare (ctx:t) (id:ident) : t =
-    if M.mem (snd id) ctx then
-      let lst = M.find (snd id) ctx in
-      M.add (snd id) (None::lst) ctx
-    else
-      M.add (snd id) [None] ctx
-
-  let remove (ctx:t) (id:ident) : t =
-    try
-      match M.find (snd id) ctx with
-      | [] -> assert false
-      | [_] -> M.remove (snd id) ctx
-      | _::lst -> M.add (snd id) lst ctx
-    with Not_found -> ctx
-
-  let fold = M.fold
-
-  let to_list (ctx:t) : (string*btype option) list =
-    let aux (s:string) (lst:btype option list) res =
-      match lst with
-      | [] -> assert false
-      | ty::_ -> (s,ty)::res
-    in
-    M.fold aux ctx []
-
-end
-
-type diff_or_prod = Diff | Prod 
+module I = Map.Make(
+  struct
+    type t = int
+    let compare = compare
+  end )
 
 (* *********************** GLOBAL CONTEXT *********************************** *)
 
 module Global :
 sig
   type t
+  type context =  btype M.t * bool
+
   val create : (string list) M.t -> string option -> t
   val set_in_rw : t -> bool -> unit
+
   val new_meta : t -> btype
-  type constr = diff_or_prod * (expression*btype) * (expression*btype) * (expression*btype)
-  val add_constraint : t -> constr -> unit
-  val get_and_remove_constraints : t -> constr list
-  val get_type_expr : t -> Local.t -> ident -> btype
-  val get_type_pred : t -> Local.t -> ident -> unit
-  val freeze : t -> unit
   val get_stype : t -> btype -> btype -> btype option
+
+  val get_expr_type : t -> btype M.t -> P.ident -> btype
+  val check_pred_usage : t -> btype M.t -> P.ident -> unit
+
+  val freeze : t -> unit
   val normalize : t -> btype -> btype
+
   val pp : unit -> t -> string
-  type context
   val context_to_string: t -> context -> string
   val iter : (string -> context -> btype option -> unit) -> t -> unit
+
+  type diff_or_prod = Diff | Prod
+  type constr = diff_or_prod * (P.expression*btype) * (P.expression*btype) * (P.expression*btype)
+  val add_constraint : t -> constr -> unit
+  val get_and_remove_constraints : t -> constr list
 end = struct
 
-  module I = Map.Make(
-    struct
-      type t = int
-      let compare = compare
-    end )
+  type context =  btype M.t * bool
 
-  type context = (string*btype option) list * bool
-  type constr = diff_or_prod * (expression*btype) * (expression*btype) * (expression*btype)
+  type diff_or_prod = Diff | Prod
+  type constr = diff_or_prod * (P.expression*btype) * (P.expression*btype) * (P.expression*btype)
 
   type e_or_p =
     | E of context * btype
@@ -119,8 +62,7 @@ end = struct
              bnfree_inv: (string list) M.t;
              mutable in_rw: bool;
              blvar: string option;
-             mutable constraints: constr list
-           }
+             mutable constraints: constr list }
 
   let create bnfree_inv blvar = {
     fvar=0;
@@ -129,8 +71,7 @@ end = struct
     bnfree_inv=bnfree_inv;
     in_rw=false;
     blvar=blvar;
-    constraints=[];
-  }
+    constraints=[] }
 
   let set_in_rw (env:t) (in_rw:bool) =
     env.in_rw <- in_rw
@@ -153,11 +94,14 @@ end = struct
     | T_Meta m when I.mem m s.subst -> I.find m s.subst
     | T_Meta _ as ty -> ty
 
-  let mk_context (env:t) (ctx:Local.t) (id:string) : context =
+  let btype_eq (env:t) (ty1:btype) (ty2:btype) : bool =
+    (normalize env ty1) = (normalize env ty2)
+
+  let mk_context (env:t) (ctx:btype M.t) (id:string) : context =
     let vars_not_in_id: string list =
       try M.find id env.bnfree_inv with Not_found -> [] in
-    let flt (s,_) = not (List.mem s vars_not_in_id) in
-    let ctx_lst = List.filter flt (Local.to_list ctx) in
+    let flt s _ = not (List.mem s vars_not_in_id) in
+    let ctx_lst = M.filter flt ctx in
     let rw = env.in_rw && (
         match env.blvar with
         | None -> true
@@ -165,28 +109,12 @@ end = struct
       ) in
     ( ctx_lst, rw )
 
-  let context_eq (env:t) (lst1,rw1:context) (lst2,rw2:context) : bool =
-    let cmp_id (s1,_) (s2,_) = String.compare s1 s2 in
-    let cmp_ty (s1,opt1) (s2,opt2) =
-      ( String.compare s1 s2 = 0) &&
-      match opt1, opt2 with
-      | None, _ | _, None -> false
-      | Some ty1, Some ty2 -> (normalize env ty1) = (normalize env ty2)
-    in
-    ( rw1 = rw2 ) &&
-    begin
-      let lst1 = List.sort cmp_id lst1 in
-      let lst2 = List.sort cmp_id lst2 in
-      try List.for_all2 cmp_ty lst1 lst2
-      with Invalid_argument _ -> false
-    end
+  let context_eq (env:t) (map1,rw1:context) (map2,rw2:context) : bool =
+    ( rw1 = rw2 ) && M.equal (btype_eq env) map1 map2
 
-  let context_to_string (env:t) (lst,rw:context) : string =
-    let aux = function
-      | (s,None) -> "(" ^ s ^ ":Unknown)"
-      | (s,Some ty) -> "(" ^ s ^ ":"^Btype.to_string ty^")"
-    in
-    let s_lst = List.map aux lst in
+  let context_to_string (env:t) (map,rw:context) : string =
+    let aux (s,ty) = "(" ^ s ^ ":"^Btype.to_string (normalize env ty)^")" in
+    let s_lst = List.map aux (M.bindings map) in
     let s_lst =
       if rw then
         match env.blvar with
@@ -196,16 +124,10 @@ end = struct
     in
     "[" ^ String.concat "" s_lst ^ "]"
 
-  let get_type_expr (env:t) (ctx:Local.t) (l,s) =
+  let get_expr_type (env:t) (ctx:btype M.t) (l,s:P.ident) : btype =
     try
       begin match Hashtbl.find env.htbl s with
-        | E (m_ctx,ty) ->
-          let u_ctx = mk_context env ctx s in
-          if context_eq env m_ctx u_ctx then ty
-          else raise (Error(l,"the joker '"^s^"' is used in an unexpected context: Current context: "
-                              ^ context_to_string env u_ctx
-                              ^ ". Expected context: "
-                              ^ context_to_string env m_ctx ^ "."))
+        | E (m_ctx,ty) -> ty
         | P _ -> raise (Error (l,"expression expected; '"^s^"' is a predicate identifier."))
       end
     with Not_found ->
@@ -216,7 +138,7 @@ end = struct
       else
         raise (Error (l,"unknown identifier '"^s^"'."))
 
-  let get_type_pred (env:t) (ctx:Local.t) (l,s) =
+  let check_pred_usage (env:t) (ctx:btype M.t) (l,s:P.ident) : unit =
     try
       begin match Hashtbl.find env.htbl s with
         | E _ -> raise (Error (l,"predicate expected; '"^s^"' is an expression identifier."))
@@ -267,20 +189,14 @@ end = struct
     | T_Meta m -> T_Set ("#"^string_of_int m)
 
   let freeze (env:t) : unit =
-    let freeze_type ty = meta_to_set (normalize env ty) in
-    let freeze_context (lst,ir) =
-      let aux = function
-        | (_,None) as elt -> elt
-        | (s,Some ty) -> (s,Some (freeze_type ty))
-      in
-      (List.map aux lst,ir)
-    in
-    let aux s = function
+    let freeze_type (ty:btype) : btype = meta_to_set (normalize env ty) in
+    let freeze_context (map,rw) : context = (M.map freeze_type map,rw) in
+    let aux (s:string) : e_or_p -> unit = function
       | P ctx -> Hashtbl.replace env.htbl s (P (freeze_context ctx))
       | E (ctx,ty) -> Hashtbl.replace env.htbl s (E (freeze_context ctx,freeze_type ty))
     in
     if env.constraints = [] then Hashtbl.iter aux env.htbl
-    else raise (Error (dloc,"internal error: Global.freeze."))
+    else raise (Error (P.dloc,"internal error: Global.freeze."))
 
   let pp () (env:t) : string =
     let aux (id:string) bp (str:string) : string =
@@ -296,47 +212,75 @@ end = struct
       | P ctx -> f s ctx None
     in
     Hashtbl.iter aux env.htbl
+
+end
+
+(* *********************** LOCAL CONTEXT ************************************ *)
+
+module Local :
+sig
+  type t
+  val empty : t
+  val declare : Global.t -> t -> P.ident -> t*btype
+  val get : t -> P.ident -> btype
+  val mem : t -> P.ident -> bool
+  val fold : (string -> btype list -> 'a -> 'a) -> t -> 'a -> 'a
+  val to_map : t -> btype M.t
+end = struct
+
+  type t = (btype list) M.t
+  let empty = M.empty
+
+  let get (ctx:t) (id:P.ident) : btype =
+    try List.hd (M.find (snd id) ctx)
+    with Not_found -> raise (Error (fst id,"unknown identifier '"^ snd id ^"'."))
+
+  let mem (ctx:t) (id:P.ident) : bool = M.mem (snd id) ctx
+
+  let declare (env:Global.t) (ctx:t) (id:P.ident) : t*btype =
+    let ty = Global.new_meta env in
+    if M.mem (snd id) ctx then
+      let lst = M.find (snd id) ctx in
+      (M.add (snd id) (ty::lst) ctx, ty)
+    else
+      (M.add (snd id) [ty] ctx, ty)
+
+  let fold = M.fold
+
+  let to_map (ctx:t) : btype M.t =
+    let aux = function
+      | [] -> assert false
+      | ty::_ -> ty
+    in
+    M.map aux ctx
+
 end
 
 type typing_env = Global.t
 
 (* *********************** ERROR MESSAGES *********************************** *)
 
-let unexpected_type env e inf exp =
+let unexpected_type (env:Global.t) (e:P.expression) (inf:btype) (exp:btype) : 'a =
   let str = Printf.sprintf
       "this expression has type '%s' but an expression of type '%s' was expected."
       (to_string (Global.normalize env inf))
       (to_string (Global.normalize env exp)) in
-  raise (Error (expr_loc e,str))
+  raise (Error (P.expr_loc e,str))
 
-let integer_or_power_expected (env:Global.t) (e:expression) (ty:btype) =
+let integer_or_power_expected (env:Global.t) (e:P.expression) (ty:btype) : 'a =
   let str = Printf.sprintf "this expression has type '%s' but an expression of type INTEGER or POW(_) was expected."
       (Btype.to_string ty) in
-  raise (Error (expr_loc e,str))
-
-let cannot_infer id =
-  raise (Error (fst id,"cannot infer the type of '"^snd id^"'."))
+  raise (Error (P.expr_loc e,str))
 
 (* ********************************* MISC *********************************** *)
 
-let ids_to_product (ctx:Local.t) ((id0,ids):ident non_empty_list) : btype =
-  let aux pr id =
-    match Local.get ctx id with
-    | None -> cannot_infer id
-    | Some ty -> T_Product (pr,ty)
-  in
-  match (id0::ids) with
-  | [] -> assert false
-  | hd::tl ->
-    begin
-      match Local.get ctx hd with
-      | None -> cannot_infer hd
-      | Some ty -> List.fold_left aux ty tl
-    end
+let ids_to_product (ctx:Local.t) ((hd,tl):P.ident non_empty_list) : btype =
+  let aux pr id = T_Product (pr,Local.get ctx id) in
+  List.fold_left aux (Local.get ctx hd) tl
 
-let get_ident_type (env:Global.t) (ctx:Local.t) (id:ident) : btype option =
+let get_ident_type (env:Global.t) (ctx:Local.t) (id:P.ident) : btype =
   if Local.mem ctx id then Local.get ctx id
-  else Some (Global.get_type_expr env ctx id)
+  else Global.get_expr_type env (Local.to_map ctx) id
 
 (* ********************************* BUILTINS ******************************** *)
 
@@ -485,317 +429,199 @@ let get_builtin_type (env:Global.t) = function
 
 (* ********************************* EXPRESSIONS **************************** *)
 
-let rec type_expr (env:Global.t) (ctx:Local.t) : expression -> btype = function
-  | Ident  id ->
-    begin
-      match get_ident_type env ctx id with
-      | Some ty -> ty
-      | None -> raise (Error (fst id,"the type of '"^ snd id ^"' cannot be infered from previous use."))
-    end
-  | Builtin (l,bi) -> get_builtin_type env bi
-  | Pbool (_,p) -> let _ = type_pred env ctx p in T_BOOL
-  | Parentheses (_,e) -> type_expr env ctx e
+let declare (env:Global.t) (ctx:Local.t) (id0,ids:P.ident non_empty_list) : Local.t * (btype*string) non_empty_list =
+  let aux (ctx,lst:Local.t*(btype*string) list) (id:P.ident) : Local.t*(btype*string) list =
+    let (ctx,ty) = Local.declare env ctx id in
+    (ctx, (ty,snd id)::lst)
+  in
+  let (ctx,t_ids) = List.fold_left aux (ctx,[]) (id0::ids) in
+  let t_ids = List.rev t_ids in
+  (ctx, (List.hd t_ids,List.tl t_ids))
 
-  | Application (l,Builtin (l2,Product),Couple(_,Infix,e1,e2)) as e3 ->
-    let ty1 = type_expr env ctx e1 in
-    let ty2 = type_expr env ctx e2 in
-    begin match ty1, ty2 with
-      (* Multiplication *)
-      | T_INTEGER, _ | _, T_INTEGER ->
-        begin match Global.get_stype env ty1 T_INTEGER with
-          | Some _ ->
-            begin match Global.get_stype env ty2 T_INTEGER with
-              | Some _ -> T_INTEGER
-              | None -> unexpected_type env e2 ty2 T_INTEGER
-            end
-          | None -> unexpected_type env e1 ty1 T_INTEGER
-        end
-      (* Cartesian Product *)
-      | T_Power _, _ | _, T_Power _ ->
-        let exp1 = T_Power (Global.new_meta env) in
-        begin match Global.get_stype env ty1 exp1 with
-          | Some (T_Power p1) ->
-            let exp2 = T_Power (Global.new_meta env) in
-            begin match Global.get_stype env ty2 exp2 with
-              | Some (T_Power p2) -> T_Power (T_Product (p1,p2))
-              | _ -> unexpected_type env e2 ty2 exp2
-            end
-          | _ -> unexpected_type env e1 ty1 exp1
-        end
+let rec type_expr (env:Global.t) (ctx:Local.t) : P.expression -> btype*T.expression = function
+  | P.Ident  id ->
+    let ty = get_ident_type env ctx id in ( ty, T.Var (ty,snd id) )
 
-      (* Cannot decide if it is a multiplication or a cartesian product *)
-      | T_Meta _, T_Meta _ ->
-        begin
-          let mt = Global.new_meta env in
-          Global.add_constraint env (Prod,(e1,ty1),(e2,ty2),(e3,mt));
-          mt
-        end
+  | P.Builtin (l,bi) ->
+    let ty = get_builtin_type env bi in (ty, T.Builtin (ty,bi) )
 
-      (* Error *)
-      | T_Meta _, _ -> integer_or_power_expected env e2 ty2
-      | _, _ -> integer_or_power_expected env e1 ty1
-    end
+  | P.Pbool (_,p) -> let p = type_pred env ctx p in (T_BOOL, T.Pbool p)
 
-  | Application (l,Builtin (_,Difference),Couple(_,Infix,e1,e2)) as e3 ->
-    let ty1 = type_expr env ctx e1 in
-    let ty2 = type_expr env ctx e2 in
-    begin match ty1, ty2 with
-      (* Soustraction *)
-      | T_INTEGER, _ | _, T_INTEGER ->
-        begin match Global.get_stype env ty1 T_INTEGER with
-          | Some _ ->
-            begin match Global.get_stype env ty2 T_INTEGER with
-              | Some _ -> T_INTEGER
-              | None -> unexpected_type env e2 ty2 T_INTEGER
-            end
-          | None -> unexpected_type env e1 ty1 T_INTEGER
-        end
+  | P.Parentheses (_,e) -> type_expr env ctx e
 
-      (* Set difference *)
-      | T_Power _, _ | _, T_Power _ ->
-        let exp1 = T_Power (Global.new_meta env) in
-        begin match Global.get_stype env ty1 exp1 with
-          | Some pow ->
-            ( match Global.get_stype env ty2 pow with
-              | Some pow -> pow
-              | _ -> unexpected_type env e2 ty2 pow )
-          | _ -> unexpected_type env e1 ty1 exp1
-        end
+  | P.Application (l,P.Builtin (l2,Product),P.Couple(_,P.Infix,e1,e2)) as e3 ->
+    let (ty1,te1) = type_expr env ctx e1 in
+    let (ty2,te2) = type_expr env ctx e2 in
+    let mt = Global.new_meta env in
+    let ty_prod = Btype.type_of_func2 ty1 ty2 mt in
+    let _ = Global.add_constraint env (Global.Prod,(e1,ty1),(e2,ty2),(e3,mt)) in
+    (mt, T.Application (T.Builtin (ty_prod,Product),T.Couple(te1,te2)))
 
-      (* Cannot decide if it is a multiplication or a cartesian product *)
-      | T_Meta _, T_Meta _ ->
-        begin
-          let mt = Global.new_meta env in
-          Global.add_constraint env (Diff,(e1,ty1),(e2,ty2),(e3,mt));
-          mt
-        end
+  | P.Application (l,P.Builtin (_,Difference),P.Couple(_,P.Infix,e1,e2)) as e3 ->
+    let (ty1,te1) = type_expr env ctx e1 in
+    let (ty2,te2) = type_expr env ctx e2 in
+    let mt = Global.new_meta env in
+    let ty_diff = Btype.type_of_func2 ty1 ty2 mt in
+    let _ = Global.add_constraint env (Global.Diff,(e1,ty1),(e2,ty2),(e3,mt)) in
+    (mt, T.Application (T.Builtin (ty_diff,Difference),T.Couple(te1,te2)))
 
-      (* Error *)
-      | T_Meta _, _ -> integer_or_power_expected env e2 ty2
-      | _, _ -> integer_or_power_expected env e1 ty1
-    end
-
-  | Application (l,f,Couple(_,_,arg1,arg2)) ->
-    begin
-      let ty_fun_inf = type_expr env ctx f in
-      let ty_fun_exp = T_Power (T_Product(
-          T_Product(Global.new_meta env,Global.new_meta env),
-          Global.new_meta env)) in
-      match Global.get_stype env ty_fun_inf ty_fun_exp with
-      | Some (T_Power (T_Product (T_Product(ty_arg1_exp,ty_arg2_exp),ty_res))) ->
-        let ty_arg1_inf = type_expr env ctx arg1 in
-        let ty_arg2_inf = type_expr env ctx arg2 in
-        ( match Global.get_stype env ty_arg1_inf ty_arg1_exp with
-          | Some _ ->
-            ( match Global.get_stype env ty_arg2_inf ty_arg2_exp with
-              | Some _ -> ty_res
-              | None -> unexpected_type env arg2 ty_arg2_inf ty_arg2_exp )
-          | None -> unexpected_type env arg1 ty_arg1_inf ty_arg1_exp )
-      | _ -> unexpected_type env f ty_fun_inf ty_fun_exp
-    end
-
-  | Application (l,e1,e2) ->
-    begin
-      let ty_fun_inf = type_expr env ctx e1 in
-      let ty_fun_exp = T_Power (T_Product (Global.new_meta env,Global.new_meta env)) in
-      match Global.get_stype env ty_fun_inf ty_fun_exp with
+  | P.Application (l,e1,e2) ->
+    let (ty_fun_inf,te1) = type_expr env ctx e1 in
+    let ty_fun_exp = T_Power (T_Product (Global.new_meta env,Global.new_meta env)) in
+    begin match Global.get_stype env ty_fun_inf ty_fun_exp with
       | Some (T_Power (T_Product (a,b))) ->
-        let ty_arg = type_expr env ctx e2 in
+        let (ty_arg, te2) = type_expr env ctx e2 in
         ( match Global.get_stype env ty_arg a with
-          | Some _ -> b
+          | Some _ -> (b, T.Application (te1,te2))
           | None -> unexpected_type env e2 ty_arg a )
       | _ -> unexpected_type env e1 ty_fun_inf ty_fun_exp
     end
 
-  | Couple (_,_,e1,e2) ->
-    let t1 = type_expr env ctx e1 in
-    let t2 = type_expr env ctx e2 in
-    T_Product (t1,t2)
-  | Sequence  (f,(hd,tl)) ->
-    begin
-      let ty_elt = type_expr env ctx hd in
-      let aux ty_exp elt =
-        let ty_inf = type_expr env ctx elt in
-        match Global.get_stype env ty_inf ty_exp with
-        | Some ty -> ty
-        | None -> unexpected_type env hd ty_inf ty_exp
-      in
-      let ty_elt = List.fold_left aux ty_elt tl in
-      T_Power (T_Product(T_INTEGER,ty_elt))
-    end
-  | Extension (l,(hd,tl)) ->
-    begin
-      let ty_elt = type_expr env ctx hd in
-      let aux ty_exp elt =
-        let ty_inf = type_expr env ctx elt in
-        match Global.get_stype env ty_inf ty_exp with
-        | Some ty -> ty
-        | None -> unexpected_type env hd ty_inf ty_exp
-      in
-      let ty_elt = List.fold_left aux ty_elt tl in
-      T_Power ty_elt
-    end
-  | Comprehension (l,(id0,ids),p) ->
-    let ctx = List.fold_left Local.declare ctx (id0::ids) in
-    let ctx = type_pred env ctx p in
-    T_Power (ids_to_product ctx (id0,ids))
-  | Binder (l,bi,(id0,ids),p,e) ->
-    begin
-      match bi with
+  | P.Couple (_,_,e1,e2) ->
+    let (ty1,te1) = type_expr env ctx e1 in
+    let (ty2,te2) = type_expr env ctx e2 in
+    (T_Product (ty1,ty2), T.Couple (te1,te2))
+
+  | P.Sequence  (_,(hd,tl)) ->
+    let (ty_elt,te_hd) = type_expr env ctx hd in
+    let aux (elt:P.expression) : T.expression =
+      let (ty_inf,te_elt) = type_expr env ctx elt in
+      match Global.get_stype env ty_inf ty_elt with
+      | Some _ -> te_elt
+      | None -> unexpected_type env hd ty_inf ty_elt
+    in
+    (Btype.type_of_seq ty_elt, T.Sequence (te_hd, List.map aux tl))
+
+  | P.Extension (l,(hd,tl)) ->
+    let (ty_elt,te_hd) = type_expr env ctx hd in
+    let aux (elt:P.expression) : T.expression =
+      let (ty_inf,te_elt) = type_expr env ctx elt in
+      match Global.get_stype env ty_inf ty_elt with
+      | Some _ -> te_elt
+      | None -> unexpected_type env hd ty_inf ty_elt
+    in
+    (T_Power ty_elt, T.Extension (te_hd,List.map aux tl))
+
+  | P.Comprehension (l,ids,p) ->
+    let (ctx,t_ids) = declare env ctx ids in
+    let pp = type_pred env ctx p in
+    (T_Power (ids_to_product ctx ids), T.Comprehension (t_ids,pp))
+
+  | P.Binder (l,bi,ids,p,e) ->
+    begin match bi with
       | Sum | Prod ->
-        begin
-          let ctx = List.fold_left Local.declare ctx (id0::ids) in
-          let ctx = type_pred env ctx p in
-          let inf = type_expr env ctx e in
-          match Global.get_stype env inf T_INTEGER with
-          | Some _ -> T_INTEGER
+        let (ctx,t_ids) = declare env ctx ids in
+        let pp = type_pred env ctx p in
+        let (inf,ee) = type_expr env ctx e in
+        begin match Global.get_stype env inf T_INTEGER with
+          | Some _ -> (T_INTEGER, T.Binder (bi,t_ids,pp,ee))
           | None -> unexpected_type env e inf T_INTEGER
         end
-      | Q_Union
-      | Q_Intersection ->
-        begin
-          let ctx = List.fold_left Local.declare ctx (id0::ids) in
-          let ctx = type_pred env ctx p in
-          let ty_inf = type_expr env ctx e in
-          let ty_exp = T_Power (Global.new_meta env) in
-          match Global.get_stype env ty_inf ty_exp with
-          | Some ty -> ty
+      | Q_Union | Q_Intersection ->
+        let (ctx,t_ids) = declare env ctx ids in
+        let pp = type_pred env ctx p in
+        let (ty_inf,ee) = type_expr env ctx e in
+        let ty_exp = T_Power (Global.new_meta env) in
+        begin match Global.get_stype env ty_inf ty_exp with
+          | Some ty -> (ty,T.Binder (bi,t_ids,pp,ee))
           | _ -> unexpected_type env e ty_inf ty_exp
         end
       | Lambda ->
-        begin
-          let ctx = List.fold_left Local.declare ctx (id0::ids) in
-          let ctx = type_pred env ctx p in
-          let ty = type_expr env ctx e in
-          T_Power (T_Product (ids_to_product ctx (id0,ids) ,ty))
-        end
+        let (ctx,t_ids) = declare env ctx ids in
+        let pp = type_pred env ctx p in
+        let (ty,ee) = type_expr env ctx e in
+        (T_Power (T_Product (ids_to_product ctx ids, ty)),
+         T.Binder (bi,t_ids,pp,ee))
     end
-  | Substitution (l,_,_,_) -> raise (Error (l,"construct not supported."))
+  | P.Substitution (l,_,_,_) -> raise (Error (l,"construct not supported."))
 
 (* ********************************* PREDICATES ***************************** *)
 
-and type_pred (env:Global.t) (ctx:Local.t) : predicate -> Local.t = function
-  (* Typing *)
-  | Binary_Pred(l,(Equality|Disequality),Ident id,e2)
-    when (get_ident_type env ctx id = None) ->
-    Local.add ctx id (type_expr env ctx e2)
+and type_pred (env:Global.t) (ctx:Local.t) : P.predicate -> T.predicate = function
+  | P.P_Builtin (_,P.Btrue) -> T.P_Builtin T.Btrue
+  | P.P_Builtin (_,P.Bfalse) -> T.P_Builtin T.Bfalse
 
-  | Binary_Pred(l,(Membership|Non_Membership),Ident id,e2)
-    when (get_ident_type env ctx id = None) ->
-    begin
-      let ty0 = T_Power (Global.new_meta env) in
-      let ty2 = type_expr env ctx e2 in
-      match Global.get_stype env ty2 ty0 with
-      | Some (T_Power ty3) -> Local.add ctx id ty3
-      | _ -> unexpected_type env  e2 ty2 ty0
-    end
-  | Binary_Pred(l,Inclusion _,Ident id,e2)
-    when (get_ident_type env ctx id = None) ->
-    begin
-      let ty0 = T_Power (Global.new_meta env) in
-      let ty2 = type_expr env ctx e2 in
-      match Global.get_stype env ty2 ty0  with
-      | None -> unexpected_type env  e2 ty2 ty0
-      | Some ty3 -> Local.add ctx id ty3
-    end
-(*
-  | Non_Membership (Pair(_,Ident id1,Ident id2),e)
-  | Membership (Pair(_,Ident id1,Ident id2),e) ->
-    begin
-      let ty_e_inf = type_expr env ctx e in
-      let ty_e_exp = T_Power (T_Product (T_Any,T_Any)) in
-      let (ty_id1_exp,ty_id2_exp) =
-        match get_stype ty_e_inf ty_e_exp with
-          | Some( T_Power (T_Product (a,b)) ) -> (a,b)
-          | _ -> unexpected_type ctx e ty_e_inf ty_e_exp
-      in
-      let aux ctx id ty_exp =
-        match get_ident_type env ctx id with
-        | None -> Local.add ctx id ty_exp
-        | Some ty_inf ->
-          ( match get_stype ty_inf ty_exp with
-            | None -> unexpected_type ctx (Ident id) ty_inf ty_exp
-            | Some _ -> ctx )
-      in
-      let ctx = aux ctx id1 ty_id1_exp in
-      aux ctx id2 ty_id2_exp
-    end
-   *)
-  (* Other *)
-  | P_Builtin _ -> ctx
-  | P_Ident id -> ( Global.get_type_pred env ctx id; ctx )
-  | Binary_Prop (l,_,p1,p2) ->
-    let ctx = type_pred env ctx p1 in
-    type_pred env ctx p2
-  | Unary_Pred (l,op,e) ->
+  | P.P_Ident id ->
+    let _ = Global.check_pred_usage env (Local.to_map ctx) id in
+    T.PVar (snd id)
+
+  | P.Binary_Prop (l,op,p1,p2) ->
+    let p1 = type_pred env ctx p1 in
+    let p2 = type_pred env ctx p2 in
+    T.Binary_Prop (op,p1,p2)
+
+  | P.Binary_Pred (l,op,e1,e2) ->
     begin match op with
-      | IsFinite ->
-        begin
-          let ty_inf = type_expr env ctx e in
-          let ty_exp = T_Power (Global.new_meta env) in
-          match Global.get_stype env ty_inf ty_exp with
-          | Some _ -> ctx
-          | None -> unexpected_type env e ty_inf ty_exp
-        end
-    end
-  | Binary_Pred (l,op,e1,e2) ->
-    begin
-      match op with
       | Equality | Disequality ->
-        begin
-          let ty1 = type_expr env ctx e1 in
-          let ty2 = type_expr env ctx e2 in
-          match Global.get_stype env ty1 ty2 with
-          | Some _ -> ctx
+        let (ty1,te1) = type_expr env ctx e1 in
+        let (ty2,te2) = type_expr env ctx e2 in
+        begin match Global.get_stype env ty1 ty2 with
+          | Some _ -> T.Binary_Pred (op,te1,te2)
           | None -> unexpected_type env e2 ty1 ty2
         end
       | Membership | Non_Membership ->
+        let (ty2,te2) = type_expr env ctx e2 in
+        let (ty1,te1) = type_expr env ctx e1 in
         begin
-          let ty2 = type_expr env ctx e2 in
-          let ty1 = type_expr env ctx e1 in
           match Global.get_stype env (T_Power ty1) ty2 with
-          | Some _ -> ctx
+          | Some _ -> T.Binary_Pred (op,te1,te2)
           | None -> unexpected_type env e2 ty2 (T_Power ty1)
         end
       | Inclusion _ ->
-        begin
-          let ty0 = T_Power (Global.new_meta env) in
-          let ty1 = type_expr env ctx e1 in
-          let ty2 = type_expr env ctx e2 in
-          match Global.get_stype env ty1 ty0 with
+        let ty0 = T_Power (Global.new_meta env) in
+        let (ty1,te1) = type_expr env ctx e1 in
+        let (ty2,te2) = type_expr env ctx e2 in
+        begin match Global.get_stype env ty1 ty0 with
           | Some ty1_bis ->
-            ( match Global.get_stype env ty1_bis ty2 with
-              | Some _ -> ctx
+            begin match Global.get_stype env ty1_bis ty2 with
+              | Some _ -> T.Binary_Pred (op,te1,te2)
               | None -> unexpected_type env e2 ty2 ty1_bis
-            )
+            end
           | None -> unexpected_type env e1 ty1 ty0
         end
       | Inequality _ ->
-        begin
-          let ty1 = type_expr env ctx e1 in
-          let ty2 = type_expr env ctx e2 in
-          match Global.get_stype env ty1 T_INTEGER with
+        let (ty1,te1) = type_expr env ctx e1 in
+        let (ty2,te2) = type_expr env ctx e2 in
+        begin match Global.get_stype env ty1 T_INTEGER with
           | Some _ ->
-            ( match  Global.get_stype env ty2 T_INTEGER with
-              | Some _ -> ctx
+            begin match  Global.get_stype env ty2 T_INTEGER with
+              | Some _ -> T.Binary_Pred (op,te1,te2)
               | None -> unexpected_type env e2 ty2 T_INTEGER
-            )
+            end
           | None -> unexpected_type env e1 ty1 T_INTEGER
         end
     end
-  | Negation (_,p) -> type_pred env ctx p
-  | Pparentheses (_,p) -> type_pred env ctx p
-  | Universal_Q (l,(f,ids),p) | Existential_Q (l,(f,ids),p) ->
-    let ctx = List.fold_left Local.declare ctx (f::ids) in
-    let ctx = type_pred env ctx p in
-    List.fold_left Local.remove ctx (f::ids)
-  | P_Substitution (l,_,_,_) -> raise (Error (l,"construct not supported."))
+
+  | P.Negation (_,p) -> type_pred env ctx p
+  | P.Pparentheses (_,p) -> type_pred env ctx p
+
+  | P.Universal_Q (l,(id,[]),p) ->
+    let (ctx,ty) = Local.declare env ctx id in
+    let pp = type_pred env ctx p in
+    T.Universal_Q (snd id,ty,pp)
+
+  | P.Universal_Q (l,(id,hd::tl),p) ->
+    let (ctx,ty) = Local.declare env ctx id in
+    let pp = type_pred env ctx (P.Existential_Q (l,(hd,tl),p)) in
+    T.Universal_Q (snd id,ty,pp)
+
+  | P.Existential_Q (l,(id,[]),p) ->
+    let (ctx,ty) = Local.declare env ctx id in
+    let pp = type_pred env ctx p in
+    T.Existential_Q (snd id,ty,pp)
+
+  | P.Existential_Q (l,(id,hd::tl),p) ->
+    let (ctx,ty) = Local.declare env ctx id in
+    let pp = type_pred env ctx (P.Existential_Q (l,(hd,tl),p)) in
+    T.Existential_Q (snd id,ty,pp)
+
+  | P.P_Substitution (l,_,_,_) -> raise (Error (l,"construct not supported."))
 
 (* *************** DELAYED TYPING CONSTRAINTS FOR '*' AND '-' *************** *)
 
 type int_or_set_operation = Int_Op | Set_Op
 
-let check_delayed_constraint (env:Global.t) (is_diff:diff_or_prod)
+let check_delayed_constraint (env:Global.t) (is_diff:Global.diff_or_prod)
     (is_int:int_or_set_operation) (e1,ty1) (e2,ty2) (e3,ty3) : unit =
   let type_diff_or_mult ty_exp =
     match Global.get_stype env ty1 ty_exp with
@@ -812,9 +638,9 @@ let check_delayed_constraint (env:Global.t) (is_diff:diff_or_prod)
   in
   match is_int, is_diff with
   | Int_Op, _ -> type_diff_or_mult T_INTEGER (* Soustraction or Multiplication *)
-  | Set_Op, Diff ->
+  | Set_Op, Global.Diff ->
     type_diff_or_mult (T_Power (Global.new_meta env)) (* Set Difference *)
-  | Set_Op, Prod -> (*Cartesian Product*)
+  | Set_Op, Global.Prod -> (*Cartesian Product*)
     let ty_exp = T_Power (Global.new_meta env) in
     begin match Global.get_stype env ty1 ty_exp with
       | Some (T_Power ty1_elt) ->
@@ -833,14 +659,14 @@ let check_delayed_constraint (env:Global.t) (is_diff:diff_or_prod)
       | None -> unexpected_type env e1 ty1 ty_exp
     end
 
-let is_int_operation (env:Global.t) (e1,ty1:expression*btype)
-    (e2,ty2:expression*btype) (e3,ty3:expression*btype) : int_or_set_operation =
+let is_int_operation (env:Global.t) (e1,ty1:P.expression*btype)
+    (e2,ty2:P.expression*btype) (e3,ty3:P.expression*btype) : int_or_set_operation =
   match ty1 with
   | T_Meta _ ->
     begin match ty2 with
       | T_Meta _ ->
         begin match ty3 with
-          | T_Meta _ -> raise (Error (expr_loc e3,"cannot infer if this expression has type T_INTEGER of POW(_)."))
+          | T_Meta _ -> raise (Error (P.expr_loc e3,"cannot infer if this expression has type T_INTEGER of POW(_)."))
           | T_INTEGER -> Int_Op
           | T_Power _ -> Set_Op
           | _ -> integer_or_power_expected env e3 ty3
@@ -871,28 +697,28 @@ let add_in_list (map:(string list) M.t) (x:string) (y:string list) : (string lis
     M.add x (y@lst) map
   with Not_found -> M.add x y map
 
-let read_guards (guards: guard list) :
-  predicate list * (string list) M.t * ident list * string option =
+let read_guards (guards: P.guard list) :
+  P.predicate list * (string list) M.t * P.ident list * string option =
   let rec aux (binhyps,bnfree,bfresh,blvar) = function
-    | Binhyp (_,p) -> (p::binhyps,bnfree,bfresh,blvar)
-    | Bfresh (_,y,lst) ->
+    | P.Binhyp (_,p) -> (p::binhyps,bnfree,bfresh,blvar)
+    | P.Bfresh (_,y,lst) ->
       let bnfree = List.fold_left
           (fun map x -> add_in_list map (snd x) [snd y]) bnfree lst in
       (binhyps,bnfree,y::bfresh,blvar)
-    | Blvar (l,id) ->
+    | P.Blvar (l,id) ->
       begin match blvar with
         | None -> (binhyps,bnfree,bfresh,Some (snd id))
         | Some _ -> raise (Error (l,"the guard 'blvar' must be unique."))
       end
-    | Bnfree (_,y,lst) ->
+    | P.Bnfree (_,y,lst) ->
       let bnfree = List.fold_left
           (fun map x -> add_in_list map (snd x) (List.map snd y)) bnfree lst in
       (binhyps,bnfree,bfresh,blvar)
   in
   List.fold_left aux ( [], M.empty, [], None ) guards
 
-let check_rule : rule -> Global.t = function
-  | Backward (guards,hyps,goal) ->
+let check_rule : P.rule -> Global.t = function
+  | P.Backward (guards,hyps,goal) ->
     begin
       let (binhyps, bnfree, bfresh, blvar) = read_guards guards in
       let env = Global.create bnfree blvar in
@@ -903,7 +729,7 @@ let check_rule : rule -> Global.t = function
       List.iter (fun p -> ignore(type_pred env Local.empty p)) hyps;
       env
     end
-  | Forward (guards,hyps,goal) ->
+  | P.Forward (guards,hyps,goal) ->
     begin
       let (binhyps, bnfree, bfresh, blvar) = read_guards guards in
       let env = Global.create bnfree blvar in
@@ -914,24 +740,24 @@ let check_rule : rule -> Global.t = function
       ignore (type_pred env Local.empty goal);
       env
     end
-  | Rewrite_E (guards,hyps,lhs,rhs) ->
+  | P.Rewrite_E (guards,hyps,lhs,rhs) ->
     begin
       let (binhyps, bnfree, bfresh, blvar) = read_guards guards in
       let env = Global.create bnfree blvar in
       let _ = Global.set_in_rw env true in
-      let ty_lhs = type_expr env Local.empty lhs in
+      let (ty_lhs,_) = type_expr env Local.empty lhs in
       let _ = Global.set_in_rw env false in
       let _ = List.iter (fun p -> ignore (type_pred env Local.empty p)) binhyps in
       let _ = check_delayed_constraints env in
       let _ = Global.freeze env in
       let _ = List.iter (fun p -> ignore(type_pred env Local.empty p)) hyps in
       let _ = Global.set_in_rw env true in
-      let ty_rhs = type_expr env Local.empty rhs in
+      let (ty_rhs,_) = type_expr env Local.empty rhs in
       match Global.get_stype env ty_lhs ty_rhs with
       | Some _ -> env
       | None -> unexpected_type env rhs ty_rhs ty_lhs
     end
-  | Rewrite_P (guards,hyps,lhs,rhs) ->
+  | P.Rewrite_P (guards,hyps,lhs,rhs) ->
     begin
       let (binhyps, bnfree, bfresh, blvar) = read_guards guards in
       let env = Global.create bnfree blvar in

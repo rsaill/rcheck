@@ -1,5 +1,6 @@
 open Utils
 open Syntax
+open Syntax.P
 
 type t_atom =
   | A_String of string
@@ -294,7 +295,7 @@ type to_guard_result =
 let is_joker s = String.length s = 1
 
 let substract (id_lst1:ident list) (id_lst2:ident list) : ident list =
-  let aux (id1:ident) : bool = not (List.exists (Utils.ident_eq id1) id_lst2) in
+  let aux (id1:ident) : bool = not (List.exists (ident_eq id1) id_lst2) in
   List.filter aux id_lst1
 
 let rec get_fvars : formula -> ident list = function
